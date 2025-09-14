@@ -73,7 +73,6 @@ class EasierLMAttention(nn.Module):
     def __call__(
         self,
         hidden_states,
-        attention_mask,   # shape (b, s) with 1 for keep, 0 for pad
         position_ids,     # shape (b, s) or (s,)
     ):
         cfg = self.config
@@ -86,6 +85,7 @@ class EasierLMAttention(nn.Module):
         proj_init = jax.nn.initializers.normal(
             cfg.initializer_range / np.sqrt(cfg.d_model)
         )
+
 
         # Projections
         xq = nn.Dense(
@@ -119,6 +119,7 @@ class EasierLMAttention(nn.Module):
         )(hidden_states)
 
         # Reshape
+
         xq = einops.rearrange(xq, "b s (h d) -> b s h d", h=cfg.n_heads)
         xk = einops.rearrange(xk, "b s (h d) -> b s h d", h=n_kv)
         xv = einops.rearrange(xv, "b s (h d) -> b s h d", h=n_kv)
@@ -149,18 +150,11 @@ class EasierLMAttention(nn.Module):
         bsz = hidden_states.shape[0]
         causal = jnp.broadcast_to(causal, (bsz,) + causal.shape[1:])  # (b,1,q,k)
 
-        # attention_mask expected as 1 for keep, 0 for pad
-        attn_keep = jnp.expand_dims(attention_mask > 0, axis=(-3, -2))  # (b,1,1,s)
-        attn_keep = jnp.broadcast_to(attn_keep, causal.shape)            # (b,1,q,k)
-
-        # Combine (boolean AND)
-        combined_mask = jnp.logical_and(causal, attn_keep)               # (b,1,q,k)
-
         # Convert to bias (add -inf where masked out)
         bias = jax.lax.select(
-            combined_mask,
-            jnp.zeros(combined_mask.shape, dtype=cfg.dtype.value),
-            jnp.full(combined_mask.shape, jnp.finfo(cfg.dtype.value).min, dtype=cfg.dtype.value),
+            causal,
+            jnp.zeros(causal.shape, dtype=cfg.dtype.value),
+            jnp.full(causal.shape, jnp.finfo(cfg.dtype.value).min, dtype=cfg.dtype.value),
         )
 
         # Attention
@@ -245,18 +239,16 @@ class EasierLMBlock(nn.Module):
                                              use_scale=self.config.elementwise_linear,
                                              reduction_axes=-1)
     @nn.compact
-    def __call__(self, hidden_states, attention_mask, position_ids):
-        attn_outputs = EasierLMAttention(self.config)(self.attention_norm(hidden_states),
-                                                        attention_mask,
+    def __call__(self, hidden_states, position_ids):
+        attn_output = EasierLMAttention(self.config)(self.attention_norm(hidden_states),
                                                         position_ids)
-        attn_output = attn_outputs[0]
         hidden_states = hidden_states + attn_output
 
         feed_forward_input = self.ffn_norm(hidden_states)
         feed_forward_hidden_states = EasierLMMLP(self.config)(feed_forward_input)
         hidden_states = hidden_states + feed_forward_hidden_states
 
-        return (hidden_states,)
+        return hidden_states
 
 class EasierLMBlockGroup(nn.Module):
     config: ModelConfig 
@@ -264,11 +256,10 @@ class EasierLMBlockGroup(nn.Module):
     def setup(self) -> None:
         self.blocks = [EasierLMBlock(self.config) for i in range(self.config.n_layers)]
     
-    def __call__(self, hidden_states, attention_mask, position_ids):
+    def __call__(self, hidden_states, position_ids):
         for block in self.blocks:
-            layer_outputs = block(hidden_states, attention_mask, position_ids)
-            hidden_states = layer_outputs[0]
-        outputs = (hidden_states)
+            hidden_states = block(hidden_states, position_ids)
+        outputs = hidden_states
         return outputs
 
 class EasierLM(nn.Module):
@@ -284,12 +275,12 @@ class EasierLM(nn.Module):
         )
         self.h = EasierLMBlockGroup(self.config)
         self.ln_f = nn.RMSNorm(
-                epsilon=self.config.norm_eps,
-                dtype=self.config.dtype.value,
-                param_dtype=self.config.param_dtype.value,
-                use_scale=self.config.elementwise_linear,
-                reduction_axes=-1,
-            )
+            epsilon=self.config.norm_eps,
+            dtype=self.config.dtype.value,
+            param_dtype=self.config.param_dtype.value,
+            use_scale=self.config.elementwise_linear,
+            reduction_axes=-1,
+        )
         self.lm_head = nn.Dense(self.config.vocab_size,
                                 dtype=self.config.dtype.value,
                                 param_dtype=self.config.param_dtype.value,
@@ -298,10 +289,14 @@ class EasierLM(nn.Module):
                                     stddev=self.config.initializer_range / np.sqrt(self.config.d_model)), 
                                 precision=self.config.precision)
     
-    def __call__(self, input_ids, attention_mask, position_ids):
-        hidden_states = self.wte(input_ids.astype("i4"))
-        outputs = self.h(hidden_states, attention_mask, position_ids=position_ids)
-        hidden_states = outputs[0]
+    @nn.compact
+    def __call__(self, input_ids, position_ids):
+        hidden_states = self.wte(input_ids)
+        # jax.debug.callback(lambda hidden_states: print(f"hidden_states: {hidden_states}"), hidden_states)
+        # jax.debug.callback(lambda hidden_states: print(f"embed_matrix: {hidden_states}"), self.wte.embedding)
+        # jax.debug.callback(lambda hidden_states: print(f"input_ids: {hidden_states}"), input_ids)
+        outputs = self.h(hidden_states, position_ids=position_ids)
+        hidden_states = outputs
         hidden_states = self.ln_f(hidden_states)
         hidden_states = self.lm_head(hidden_states)
         return hidden_states

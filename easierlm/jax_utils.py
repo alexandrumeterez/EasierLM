@@ -240,12 +240,9 @@ def mse_loss(val, target, valid=None):
     return loss
 
 
-def cross_entropy_loss_and_accuracy(logits, tokens, valid=None):
-    if valid is None:
-        valid = jnp.ones(tokens.shape[:2])
-    valid = valid.astype(jnp.float32)
-    valid_text_length = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
+def cross_entropy_loss(logits, tokens, ce_mask):
     logits = logits.astype(jnp.float32) # for numerical stability
+    jax.debug.callback(lambda x: print(f"ce mask: {x.shape} {x}"), ce_mask)
     token_log_prob = jnp.squeeze(
         jnp.take_along_axis(
             jax.nn.log_softmax(logits, axis=-1),
@@ -254,15 +251,11 @@ def cross_entropy_loss_and_accuracy(logits, tokens, valid=None):
         ),
         -1,
     )
-    token_log_prob = jnp.where(valid > 0.0, token_log_prob, jnp.array(0.0))
+
+    token_log_prob = jnp.where(ce_mask > 0.0, token_log_prob, 0.0)
+    valid_text_length = jnp.sum(ce_mask > 0.0, axis=-1)
     loss = -jnp.mean(jnp.sum(token_log_prob, axis=-1) / valid_text_length)
-    correct = jnp.where(
-        valid > 0.0,
-        jnp.argmax(logits, axis=-1) == tokens,
-        jnp.array(False)
-    )
-    accuracy = jnp.mean(jnp.sum(correct, axis=-1) / valid_text_length)
-    return loss, accuracy
+    return loss
 
 
 def global_norm(tree):

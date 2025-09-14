@@ -3,6 +3,8 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Union
 import jax.numpy as jnp
 import jax
+import glob
+from dataclasses import dataclass, field
 
 class LayerNormType(Enum):
     ln = "ln"
@@ -37,7 +39,7 @@ class ModelConfig:
     mlp_ratio: int = 4
     activation_type: ActivationType = ActivationType.relu
     dtype: DataType = DataType.bf16
-    param_dtype: DataType = DataType.bf16
+    param_dtype: DataType = DataType.fp32
     precision: jax.lax.Precision = jax.lax.Precision.HIGH
     initializer_range: float = 1.0
     use_rope: bool = True
@@ -45,5 +47,21 @@ class ModelConfig:
     normalize_qk: bool=True
 
     # data size
-    vocab_size: int = 32000
+    vocab_size: int = 32100
     max_seq_len: int = 16
+
+
+@dataclass
+class DataConfig:
+    files: List[str] = field(
+        default_factory=lambda: glob.glob(
+            "/n/holylfs06/LABS/kempner_shared/Everyone/testbed/text/dolma/tokenized/t5-base/c4/*.npy"
+        )
+    )
+    total_tokens: int = 100_000_000
+    seq_len: int = 128
+    per_device_batch: int = 64
+    eos_id: Optional[int] = 1
+    seed: int = 0
+    prefetch: int = 2
+    reshuffle_each_epoch: bool = False

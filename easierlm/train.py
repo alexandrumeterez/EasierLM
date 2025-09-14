@@ -1,85 +1,98 @@
-from easierlm.config import ModelConfig
+from easierlm.config import ModelConfig, DataConfig
 from easierlm.model import EasierLM
 from easierlm.jax_utils import JaxRNG
-
+from easierlm.data.loader import TokenSubsetLoader
 import jax
 import jax.numpy as jnp
 import optax
 import time
 from flax.training.train_state import TrainState
+from tqdm import trange
+from tqdm import tqdm
+import mlxu
+from easierlm.optimizers import AdamWOptimizerFactory
+from easierlm.jax_utils import (
+    JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
+    cross_entropy_loss, global_norm, get_float_dtype_by_name,
+    set_random_seed, average_metrics, make_shard_and_gather_fns,
+    with_sharding_constraint,
+)
+import pprint
+from jax.experimental.pjit import pjit
 
+FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
+    seed=0,
+    optimizer = AdamWOptimizerFactory.get_default_config()
+)
 
-def make_dummy_batch(vocab_size: int, batch_size: int, seq_length: int):
-    # token ids in [0, vocab_size)
-    input_ids = (jnp.arange(seq_length) % vocab_size)[None, :].repeat(batch_size, axis=0).astype(jnp.int32)
-    # standard 0..T-1 positions
-    position_ids = jnp.arange(seq_length)[None, :].repeat(batch_size, axis=0).astype(jnp.int32)
-    # full attention mask (keep = 1)
-    attention_mask = jnp.ones((batch_size, seq_length), dtype=jnp.int32)
-    return input_ids, position_ids, attention_mask
+def main(argv):
+    set_random_seed(FLAGS.seed)
+    data_cfg = DataConfig()
+    model_cfg = ModelConfig()
+    loader = TokenSubsetLoader(data_cfg)
+    model = EasierLM(model_cfg)
 
-
-def main():
-    # ----- 1) Build config/model -----
-    config = ModelConfig()
-    model = EasierLM(config)
-
-    # Heuristics for names some configs use
-    vocab_size = int(getattr(config, "vocab_size", 32000))
-    seq_length = int(getattr(config, "seq_len", getattr(config, "max_seq_len", 16)))
-    batch_size = 2
-
-    input_ids, position_ids, attention_mask = make_dummy_batch(vocab_size, batch_size, seq_length)
-
-    # ----- 2) Optimizer + TrainState skeleton (even if we only forward-pass) -----
-    optimizer = optax.adamw(1e-3)
-
-    # RNGs
-    key = jax.random.PRNGKey(0)
-    key_params, key_dropout, key_apply = jax.random.split(key, 3)
-
-    # ----- 3) Correct Flax init call (jit compiled) -----
-    # NOTE: model.init signature is model.init(rngs, *args, **kwargs)
-    # If the model doesn't use dropout at init, the extra key is harmless.
-    init_fn = jax.jit(
-        lambda k_params, k_drop, x, pos, mask: model.init(
-            {"params": k_params, "dropout": k_drop},
-            input_ids=x,
-            position_ids=pos,
-            attention_mask=mask,
+    optimizer, optimizer_info = AdamWOptimizerFactory.get_optimizer(FLAGS.optimizer)
+    def init_fn(rng):
+        rng_generator = JaxRNG(rng)
+        params = model.init(
+            input_ids=jnp.zeros((data_cfg.per_device_batch, model_cfg.max_seq_len), dtype=jnp.int32),
+            position_ids=jnp.zeros((data_cfg.per_device_batch, model_cfg.max_seq_len), dtype=jnp.int32),
+            rngs=rng_generator(('params',)),
         )
-    )
-
-    t0 = time.time()
-    variables = init_fn(key_params, key_dropout, input_ids, position_ids, attention_mask)
-    t1 = time.time()
-    print(f"[init] compiled+ran in {t1 - t0:.3f}s")
-
-    # Create TrainState (params only; we're not training here)
-    state = TrainState.create(params=variables["params"], tx=optimizer, apply_fn=model.apply)
-
-    # ----- 4) JIT-compiled forward pass -----
-    # We pass rngs={'dropout': key} for safety; ignored if model has no dropout.
-    @jax.jit
-    def fwd(params, x, pos, mask, k_drop):
-        return model.apply({"params": params}, x, pos, mask, rngs={"dropout": k_drop})
-
-    # First run triggers compilation
-    t0 = time.time()
-    out = fwd(state.params, input_ids, position_ids, attention_mask, key_apply)
-    t1 = time.time()
-    print(f"[apply #1] compiled+ran in {t1 - t0:.3f}s; output shape = {out.shape}")
-
-    # Second run should be fast (cached)
-    t0 = time.time()
-    out2 = fwd(state.params, input_ids, position_ids, attention_mask, jax.random.split(key_apply, 2)[0])
-    t1 = time.time()
-    print(f"[apply #2] cached run in {t1 - t0:.6f}s")
-
-    # Peek a few numbers
-    print("Output sample (first batch row, first 5 positions):")
-    print(jnp.asarray(out[0, :5]))
+        return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 
 
+    def train_step(train_state, rng, batch):
+        rng_generator = JaxRNG(rng)
+        input_tokens, target_tokens, ce_mask = batch
+
+        jax.debug.callback(lambda x: print(f"input_tokens: {x}"), input_tokens)
+        jax.debug.callback(lambda x: print(f"output_tokens: {x}"), target_tokens)
+
+        # dummy values since we are not padding but TODO in the future
+        position_ids = jnp.tile(jnp.arange(input_tokens.shape[-1])[:, ...], reps=(input_tokens.shape[0], 1))
+
+
+        def loss_fn(params):
+            logits = model.apply(
+                params, input_tokens, position_ids,
+                rngs=rng_generator(('params',)),
+            )
+            return cross_entropy_loss(
+                logits, target_tokens, ce_mask
+            )
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=False)
+        loss, grads = grad_fn(train_state.params)
+        train_state = train_state.apply_gradients(grads=grads)
+        metrics = dict(
+            loss=loss,
+            learning_rate=optimizer_info['learning_rate_schedule'](train_state.step),
+            gradient_norm=global_norm(grads),
+            param_norm=global_norm(train_state.params),
+        )
+        return train_state, rng_generator(), metrics
+
+    jitted_init_fn = pjit(init_fn)
+    jitted_train_step = pjit(train_step)
+
+    train_state = jitted_init_fn(next_rng())
+    start_step = int(jax.device_get(train_state.step))
+    sharded_rng = next_rng()
+
+
+    for epoch in range(1):
+        for step, batch in enumerate(loader.epoch(epoch)):
+            train_state, sharded_rng, metrics = jitted_train_step(
+                train_state, sharded_rng, batch
+            )
+
+            if step % 1 == 0:
+                log_metrics = {"step": step}
+                log_metrics.update(metrics)
+                # log_metrics.update(dataset_meutrics)
+                log_metrics = jax.device_get(log_metrics)
+                tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
+            break
 if __name__ == '__main__':
-    main()
+    mlxu.run(main)
