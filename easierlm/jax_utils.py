@@ -242,7 +242,6 @@ def mse_loss(val, target, valid=None):
 
 def cross_entropy_loss(logits, tokens, ce_mask):
     logits = logits.astype(jnp.float32) # for numerical stability
-    jax.debug.callback(lambda x: print(f"ce mask: {x.shape} {x}"), ce_mask)
     token_log_prob = jnp.squeeze(
         jnp.take_along_axis(
             jax.nn.log_softmax(logits, axis=-1),

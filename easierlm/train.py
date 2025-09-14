@@ -36,8 +36,8 @@ def main(argv):
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
         params = model.init(
-            input_ids=jnp.zeros((data_cfg.per_device_batch, model_cfg.max_seq_len), dtype=jnp.int32),
-            position_ids=jnp.zeros((data_cfg.per_device_batch, model_cfg.max_seq_len), dtype=jnp.int32),
+            input_ids=jnp.zeros((data_cfg.per_device_batch, data_cfg.seq_len), dtype=jnp.int32),
+            position_ids=jnp.zeros((data_cfg.per_device_batch, data_cfg.seq_len), dtype=jnp.int32),
             rngs=rng_generator(('params',)),
         )
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
@@ -46,11 +46,6 @@ def main(argv):
     def train_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
         input_tokens, target_tokens, ce_mask = batch
-
-        jax.debug.callback(lambda x: print(f"input_tokens: {x}"), input_tokens)
-        jax.debug.callback(lambda x: print(f"output_tokens: {x}"), target_tokens)
-
-        # dummy values since we are not padding but TODO in the future
         position_ids = jnp.tile(jnp.arange(input_tokens.shape[-1])[:, ...], reps=(input_tokens.shape[0], 1))
 
 
@@ -90,7 +85,6 @@ def main(argv):
             if step % 1 == 0:
                 log_metrics = {"step": step}
                 log_metrics.update(metrics)
-                # log_metrics.update(dataset_meutrics)
                 log_metrics = jax.device_get(log_metrics)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
             break

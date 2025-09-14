@@ -48,7 +48,6 @@ class ModelConfig:
 
     # data size
     vocab_size: int = 32100
-    max_seq_len: int = 16
 
 
 @dataclass
